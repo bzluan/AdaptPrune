@@ -31,7 +31,16 @@ class LlavaConfig(LlamaConfig):
     model_type = "llava_llama"
 
 
-class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
+# class LlavaLlamaModel(LlavaMetaModel, LlamaModel):
+#     config_class = LlavaConfig
+
+#     def __init__(self, config: LlamaConfig):
+#         super(LlavaLlamaModel, self).__init__(config)
+
+# from .fastv_kvcache import FastVLlamaModel
+from .adaptprune import FastVLlamaModel
+
+class LlavaLlamaModel(LlavaMetaModel, FastVLlamaModel): # Alter LlamaModel to  FastVLlamaModel
     config_class = LlavaConfig
 
     def __init__(self, config: LlamaConfig):

@@ -6,6 +6,8 @@ from transformers.models.llama import LlamaConfig
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from typing import List, Optional, Tuple, Union
 
+import torch.nn.functional as F
+import matplotlib.pyplot as plt
 
 class FastVLlamaModel(LlamaModel):
     """
@@ -64,7 +66,8 @@ class FastVLlamaModel(LlamaModel):
             if use_legacy_cache:
                 past_key_values = DynamicCache.from_legacy_cache(past_key_values)
             past_key_values_length = past_key_values.get_usable_length(seq_length)
-
+        
+        # print("seq_length, past_key_values_length: ",seq_length, past_key_values_length)
 
         if position_ids is None:
             device = input_ids.device if input_ids is not None else inputs_embeds.device
@@ -118,18 +121,113 @@ class FastVLlamaModel(LlamaModel):
             else:
                 K = 2
                 ratio = 0.1
+                
+                query_layer = decoder_layer.self_attn.q_proj(hidden_states)
+                key_layer = decoder_layer.self_attn.k_proj(hidden_states)
+                value_layer = decoder_layer.self_attn.v_proj(hidden_states)
 
+                
                 if decoder_layer.self_attn.layer_idx == K and seq_length > 1:
-                    device = hidden_states.device
-                    image_attention_score = self.last_attention.mean(dim=1)[0][-1][35:611]  
-                    top_attention_rank_index = image_attention_score.topk(int(576 * ratio)).indices + 35
-                    keep_indexs = torch.cat((torch.arange(35,device=device), top_attention_rank_index, torch.arange(611,seq_length,device=device)))
-                    keep_indexs = keep_indexs.sort().values
-                    hidden_states = hidden_states[:,keep_indexs,:]
-                    if attention_mask is not None:
-                        attention_mask = attention_mask[:,:,:hidden_states.shape[1],:hidden_states.shape[1]]
-                    position_ids = keep_indexs.unsqueeze(0)
+                    processed_hidden_states = []
+                    processed_attention_masks = []
+                    processed_position_ids = []
+                    
 
+                    def adapt_nms_2d(att_scores, key_vectors, distance_limit, distance_sigma, similarity_sigma, max_output_size):
+                        """
+                        进行Soft-NMS 基于attention score、空间位置和key向量相似度来选择token
+                        Args:
+                            scores: 24x24 形式的 attention 分数 (GPU tensor)
+                            sigma: 控制高斯衰减的参数
+                            max_output_size: 保留 tokens 的数量（根据 ratio 设定）
+                            distance_limit: 限制高斯衰减的距离
+                        Returns:
+                            selected_indices: Soft-NMS 后选择的 indices 列表
+                        """
+                        grid_size = att_scores.size(0)  # 24x24
+                        x_coords = torch.arange(grid_size, device=att_scores.device)
+                        y_coords = torch.arange(grid_size, device=att_scores.device)
+                        grid_x, grid_y = torch.meshgrid(x_coords, y_coords, indexing="ij")
+
+                        keep = []
+                        scores_copy = att_scores.clone()
+
+                        for step in range(max_output_size):
+                            top_idx = torch.argmax(scores_copy)
+                            top_x = top_idx // grid_size
+                            top_y = top_idx % grid_size
+                            keep.append(top_idx.item())
+                            if len(keep) >= max_output_size:
+                                break
+                            distance = torch.sqrt((grid_x - top_x).float() ** 2 + (grid_y - top_y).float() ** 2)
+                            window_mask = distance <= distance_limit
+                            gauss_decay = torch.exp(-(distance ** 2) / (2 * distance_sigma ** 2))
+                            current_key = key_vectors[top_idx, :] 
+
+                            similarity_map = F.cosine_similarity(key_vectors, current_key.unsqueeze(0), dim=-1)
+                            similarity_map_reshaped = similarity_map.view(grid_size, grid_size)
+                            similarity_gauss_decay = torch.exp(-((1 - similarity_map_reshaped) ** 2) / (2 * similarity_sigma ** 2))
+                            combined_decay = gauss_decay * similarity_gauss_decay
+                            scores_copy[window_mask] *= (1 - combined_decay[window_mask])
+
+                        return torch.tensor(keep, device=att_scores.device)
+
+                    for batch_idx in range(batch_size):
+                        device = hidden_states.device
+                        image_attention_score = self.last_attention.mean(dim=1)[batch_idx][-1][35:611]
+                        image_attention_map = image_attention_score.view(1, 1, 24, 24)
+
+                        image_key = key_layer[batch_idx, 35:611, :]
+                        image_key = F.normalize(image_key, p=2, dim=-1)  # shape: [576, hidden_size]
+
+                        def create_gaussian_mask(size, sigma, max_value=1.0):
+                            """
+                            创建一个基于高斯分布的 mask，其中中心区域值最大，离中心越远值越小。
+                            
+                            参数:
+                            - size: mask 的大小 (size x size)
+                            - sigma: 高斯分布的标准差，控制衰减速度
+                            - max_value: 高斯分布中心的最大值
+                            
+                            返回:
+                            - 一个 size x size 的 mask，在 GPU 上
+                            """
+                            coords = torch.linspace(-size // 2, size // 2, size, device=image_attention_map.device)
+                            x, y = torch.meshgrid(coords, coords)
+                            gaussian = torch.exp(-(x**2 + y**2) / (2 * sigma**2))
+                            
+                            gaussian = gaussian / gaussian.max() * max_value
+                            return gaussian
+
+                        # 生成一个24x24的高斯mask，sigma可以根据需要调整
+                        sigma = 12.0
+                        mask = create_gaussian_mask(24, sigma, max_value=1.0)
+                        image_attention_map = image_attention_map * mask
+
+                        image_attention_map = image_attention_map.view(24, 24).to(device)
+                        soft_nms_selected_indices = adapt_nms_2d(image_attention_map, image_key, distance_limit=5, distance_sigma=1.5, similarity_sigma = 0.05, max_output_size=int(576 * ratio)) + 35
+                        soft_nms_selected_indices = soft_nms_selected_indices.to(device)
+
+                        keep_indexs = torch.cat((
+                            torch.arange(35, device=device),
+                            soft_nms_selected_indices,
+                            torch.arange(611, seq_length, device=device)
+                        ))
+
+                        keep_indexs = keep_indexs.sort().values
+                        
+                        batch_hidden_states = hidden_states[batch_idx:batch_idx+1, keep_indexs, :]
+                        processed_hidden_states.append(batch_hidden_states)
+                    
+                        if attention_mask is not None:
+                            attention_mask = attention_mask[:,:,:hidden_states.shape[1],:hidden_states.shape[1]]
+                            
+                        batch_position_ids = keep_indexs.unsqueeze(0)
+                        processed_position_ids.append(batch_position_ids)
+                    
+                    hidden_states = torch.cat(processed_hidden_states, dim=0)
+                    position_ids = torch.cat(processed_position_ids, dim=0)
+                
                 if decoder_layer.self_attn.layer_idx == K - 1:
                     temp_layer_outputs = decoder_layer(
                         hidden_states,
