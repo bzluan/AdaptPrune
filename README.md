@@ -1,6 +1,8 @@
 #  AdaptPrune
 
-*Multi-Cue Adaptive Visual Token Pruning for Large Vision-Language Models*
+This is the implementation of the paper *Multi-Cue Adaptive Visual Token Pruning for Large Vision-Language Models*
+
+As the computational needs of Large Vision-Language Models (LVLMs) increase, visual token pruning has proven effective in improving inference speed and memory efficiency. Traditional pruning methods in LVLMs predominantly focus on attention scores to determine token relevance, overlooking critical aspects such as spatial position and token similarity. To this end, we introduce AdaptPrune, a novel plug-and-play training-free pruning method that builds on conventional attention-based pruning by integrating spatial distance and token similarity with an adaptive NMS approach. Our method is based on several observed phenomena in large models: the positional bias in the model's image attention and the redundancy of token information ignored by previous approaches. By integrating attention, spatial, and similarity information, our approach ensures a comprehensive evaluation of token importance and substantially refines the pruning decisions. Our method has been extensively tested across various LVLMs and benchmarks, confirming its robustness and adaptability. The results demonstrate that AdaptPrune consistently outperforms existing methods across various pruning ratios.
 
 The code is based on [LLaVA-1.5](https://github.com/haotian-liu/LLaVA) and [FastV](https://github.com/pkunlp-icler/FastV).
 
